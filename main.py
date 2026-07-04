@@ -30,6 +30,7 @@ import numpy as np
 import scipy.io
 import matplotlib.pyplot as plt
 import time
+from scipy.signal import gaussian
 
 # Auxiliary functions
 def vect(a):
@@ -67,7 +68,7 @@ def C_matrix(x, N1, N2, Nc, tau, kernel_shape):
     return result
 
 def ChC_FFT_convolutions(X, N1, N2, Nc, tau, pad, kernel_shape):
-    in1, in2 = np.meshgrid(np.arange(-tau, tau+1), np.arange(-tau, tau+1), indexing='xy')
+    in1, in2 = np.meshgrid(np.arange(-tau, tau + 1), np.arange(-tau, tau + 1), indexing='xy')
     if kernel_shape == 1:
         mask = in1**2 + in2**2 <= tau**2
         i = np.where(mask.flatten(order='F'))[0]
@@ -78,45 +79,40 @@ def ChC_FFT_convolutions(X, N1, N2, Nc, tau, pad, kernel_shape):
     patchSize = len(in1)
 
     if pad:
-        N1n = 2 ** int(np.ceil(np.log2(N1 + 2*tau)))
-        N2n = 2 ** int(np.ceil(np.log2(N2 + 2*tau)))
+        N1n = 2 ** int(np.ceil(np.log2(N1 + 2 * tau)))
+        N2n = 2 ** int(np.ceil(np.log2(N2 + 2 * tau)))
     else:
         N1n = N1
         N2n = N2
 
-    # 构建列优先线性索引矩阵 inds (patchSize, patchSize)
+    # 关键修复：MATLAB 用 floor(N/2)+1（1-based），Python 0-based 等价为 N//2
     row_inds = (N1n // 2) - in1[:, np.newaxis] + in1[np.newaxis, :]
     col_inds = (N2n // 2) - in2[:, np.newaxis] + in2[np.newaxis, :]
-    row_inds = np.clip(row_inds, 0, N1n-1).astype(int)
-    col_inds = np.clip(col_inds, 0, N2n-1).astype(int)
-    inds = np.ravel_multi_index((row_inds, col_inds), (N1n, N2n), order='F')   # 列优先
+    row_inds = np.clip(row_inds.astype(int), 0, N1n - 1)
+    col_inds = np.clip(col_inds.astype(int), 0, N2n - 1)
+    inds = np.ravel_multi_index((row_inds, col_inds), (N1n, N2n), order='F')
 
     n1_freq = np.fft.fftshift(np.fft.fftfreq(N1n))
     n2_freq = np.fft.fftshift(np.fft.fftfreq(N2n))
     n2, n1 = np.meshgrid(n2_freq, n1_freq, indexing='xy')
+    phaseKernel = np.exp(-1j * 2 * np.pi * (n1 * ((N1n + 1) // 2 + tau) + n2 * ((N2n + 1) // 2 + tau)))
+    cphaseKernel = np.exp(-1j * 2 * np.pi * (n1 * ((N1n + 1) // 2) + n2 * ((N2n + 1) // 2)))
 
-    phaseKernel = np.exp(-1j * 2 * np.pi * (n1 * ((N1n+1)//2 + tau) + n2 * ((N2n+1)//2 + tau)))
-    cphaseKernel = np.exp(-1j * 2 * np.pi * (n1 * ((N1n+1)//2) + n2 * ((N2n+1)//2)))
-
-    x = np.fft.fft2(X, s=(N1n, N2n), axes=(0,1)) * phaseKernel[:, :, np.newaxis]
+    x = np.fft.fft2(X, s=(N1n, N2n), axes=(0, 1)) * phaseKernel[:, :, np.newaxis]
 
     PhP = np.zeros((patchSize, patchSize, Nc, Nc), dtype=complex)
     for q in range(Nc):
-        x_rest = x[:, :, q:]                     # (N1n,N2n,Nc-q)
-        x_q = x[:, :, q]                          # (N1n,N2n)
+        x_rest = x[:, :, q:]
+        x_q = x[:, :, q]
         prod = np.conj(x_rest) * x_q[:, :, np.newaxis] * cphaseKernel[:, :, np.newaxis]
-        b = np.fft.ifft2(prod, axes=(0,1))        # (N1n,N2n,Nc-q)
-
-        b = b.reshape(-1, Nc - q, order='F')      # 列优先
-        b_selected = b[inds.flatten(order='F'), :]  # (patchSize*patchSize, Nc-q)
+        b = np.fft.ifft2(prod, axes=(0, 1))
+        b = b.reshape(-1, Nc - q, order='F')
+        b_selected = b[inds.flatten(order='F'), :]
         b_selected = b_selected.reshape(patchSize, patchSize, Nc - q, order='F')
-
         PhP[:, :, q:, q] = b_selected
         if q < Nc - 1:
-            PhP[:, :, q, q+1:] = np.conj(PhP[:, :, q+1:, q].transpose(1, 0, 2))
-
-    PhP = PhP.transpose(0, 2, 1, 3)                # (patchSize, Nc, patchSize, Nc)
-    PhP = PhP.reshape(patchSize * Nc, patchSize * Nc, order='F')
+            PhP[:, :, q, q + 1:] = np.conj(PhP[:, :, q + 1:, q].transpose(1, 0, 2))
+    PhP = PhP.transpose(0, 2, 1, 3).reshape(patchSize * Nc, patchSize * Nc, order='F')
     return PhP
 
 def nullspace_vectors_C_matrix(kCal, tau, threshold, kernel_shape, FFT_nullspace_C_calculation):
@@ -217,55 +213,45 @@ def nullspace_vectors_G_matrix(kCal, N1, N2, G, patchSize,
         eigenVal = np.zeros((N1_g, N2_g, Nc), dtype=float)
         for i in range(N1_g):
             for j in range(N2_g):
-                # np.linalg.svd returns U, s, Vh where s is 1D vector, Vh is V.conj().T
                 U, s, Vh = np.linalg.svd(G[i, j, :, :], full_matrices=False)
-                # V_last equals V[:, -1]
                 V_last = Vh[-1, :].conj()
-                # phase correction: use V_last[0] (V(1,end) in MATLAB)
                 senseMaps[i, j, :] = V_last * np.exp(-1j * np.angle(V_last[0]))
-                # s is 1D singular values vector (length Nc)
                 eigenVal[i, j, :] = np.abs(s)
         eigenVal = eigenVal / patchSize
         return senseMaps, eigenVal
 
     # ----- Power-iteration branch -----
-    # scale G by patchSize (MATLAB: G = G/patchSize)
     G = G / patchSize
 
-    # build identity minus G and permute dims to match MATLAB permute([1 2 4 3])
     G_null = np.zeros_like(G)
     for c in range(Nc):
         G_null[:, :, c, c] = 1.0
     G_null = G_null - G
-    G_null = np.transpose(G_null, (0, 1, 3, 2))  # shape (N1_g, N2_g, Nc, Nc)
+   
 
     # branch: no convergence checking, fixed M iterations
     if PowerIteration_flag_convergence == 0 and PowerIteration_flag_auto == 0:
-        # init random complex maps and normalize per-pixel across channels
         senseMaps = (np.random.randn(N1_g, N2_g, Nc) + 1j * np.random.randn(N1_g, N2_g, Nc))
         norm = np.sqrt(np.sum(np.abs(senseMaps)**2, axis=2))
         norm = np.maximum(norm, eps)
         senseMaps = senseMaps / norm[:, :, np.newaxis]
 
         for m in range(M):
-            # multiply: equivalent to MATLAB squeeze(sum(G_null .* repmat(senseMaps,[1 1 1 Nc]), 3))
-            tmp = np.sum(G_null * senseMaps[:, :, np.newaxis, :], axis=3)
-            # normalize
+            tmp = np.einsum('xyij,xyj->xyi', G_null, senseMaps)
             norm = np.sqrt(np.sum(np.abs(tmp)**2, axis=2))
             norm = np.maximum(norm, eps)
             senseMaps = tmp / norm[:, :, np.newaxis]
             if m == M - 1:
-                aux1 = np.sum(G_null * senseMaps[:, :, np.newaxis, :], axis=3)
+                aux1 = np.einsum('xyij,xyj->xyi', G_null, senseMaps)
                 final_maps_norm = np.sqrt(np.sum(np.abs(aux1)**2, axis=2))
 
         eigenVal = 1.0 - final_maps_norm
-        # keep eigenVal as 2D (N1_g,N2_g); matches later code paths expecting 2D when PI used
+
     else:
         # convergence checking path (compute first and second eigenvectors)
         senseMaps = (np.random.randn(N1_g, N2_g, Nc) + 1j * np.random.randn(N1_g, N2_g, Nc))
         eigenVec2 = (np.random.randn(N1_g, N2_g, Nc) + 1j * np.random.randn(N1_g, N2_g, Nc))
 
-        # normalize both
         norm = np.sqrt(np.sum(np.abs(senseMaps)**2, axis=2))
         norm = np.maximum(norm, eps)
         senseMaps = senseMaps / norm[:, :, np.newaxis]
@@ -275,27 +261,23 @@ def nullspace_vectors_G_matrix(kCal, N1, N2, G, patchSize,
         eigenVec2 = eigenVec2 / norm2[:, :, np.newaxis]
 
         for m in range(M):
-            # power iterate both vectors
-            senseMaps = np.sum(G_null * senseMaps[:, :, np.newaxis, :], axis=3)
-            eigenVec2 = np.sum(G_null * eigenVec2[:, :, np.newaxis, :], axis=3)
+            senseMaps = np.einsum('xyij,xyj->xyi', G_null, senseMaps)
+            eigenVec2 = np.einsum('xyij,xyj->xyi', G_null, eigenVec2)
 
-            # normalize senseMaps
             norm = np.sqrt(np.sum(np.abs(senseMaps)**2, axis=2))
             norm = np.maximum(norm, eps)
             senseMaps = senseMaps / norm[:, :, np.newaxis]
 
-            # orthogonalize eigenVec2 relative to senseMaps (Gram-Schmidt)
-            inner_prod = np.sum(eigenVec2 * np.conj(senseMaps), axis=2)  # shape (N1_g, N2_g)
+            inner_prod = np.sum(eigenVec2 * np.conj(senseMaps), axis=2)
             eigenVec2 = eigenVec2 - inner_prod[:, :, np.newaxis] * senseMaps
 
-            # normalize eigenVec2
             norm2 = np.sqrt(np.sum(np.abs(eigenVec2)**2, axis=2))
             norm2 = np.maximum(norm2, eps)
             eigenVec2 = eigenVec2 / norm2[:, :, np.newaxis]
 
             if m == M - 1:
-                aux1 = np.sum(G_null * senseMaps[:, :, np.newaxis, :], axis=3)
-                aux2 = np.sum(G_null * eigenVec2[:, :, np.newaxis, :], axis=3)
+                aux1 = np.einsum('xyij,xyj->xyi', G_null, senseMaps)
+                aux2 = np.einsum('xyij,xyj->xyi', G_null, eigenVec2)
                 final_maps_norm = np.sqrt(np.sum(np.abs(aux1)**2, axis=2))
                 final_maps_norm2 = np.sqrt(np.sum(np.abs(aux2)**2, axis=2))
 
@@ -308,8 +290,12 @@ def nullspace_vectors_G_matrix(kCal, N1, N2, G, patchSize,
             threshold_mask = 0.075
             support_mask = (eigenVal < threshold_mask).astype(float)
 
-            # safe ratio: avoid divide-by-zero
-            ratioEig = (eigen2 / (eigen1 + eps)) ** M
+            # === SAFE RATIO (MATLAB 完全一致 + 防 infinite loop) ===
+            # MATLAB 原版在 eigen1==0 时会产生 inf，但 support 区域实际不会导致 infinite
+            # Python 这里设 tiny 区域 ratio=0（不触发 flag），否则数值噪声会导致死循环
+            valid = (eigen1 > 1e-12)
+            ratioEig = np.zeros_like(eigen2)
+            ratioEig[valid] = np.minimum((eigen2[valid] / eigen1[valid]), 1.0) ** M
             ratio_small = support_mask * ratioEig
             th_ratio = 0.008
             ratio_small = (ratio_small > th_ratio).astype(int)
@@ -329,11 +315,11 @@ def nullspace_vectors_G_matrix(kCal, N1, N2, G, patchSize,
             # automatic increase of M until convergence
             if PowerIteration_flag_auto == 1 and flag_convergence_PI == 1:
                 if verbose == 1:
-                    print('Power Iteration auto-adjusting iterations (may take longer).')
+                    print('Power Iteration auto-adjusting iterations.')
                 M_auto = M + 1
-                while flag_convergence_PI:
-                    senseMaps = np.sum(G_null * senseMaps[:, :, np.newaxis, :], axis=3)
-                    eigenVec2 = np.sum(G_null * eigenVec2[:, :, np.newaxis, :], axis=3)
+                while flag_convergence_PI and M_auto < 100:  # 安全上限，防止死循环
+                    senseMaps = np.einsum('xyij,xyj->xyi', G_null, senseMaps)
+                    eigenVec2 = np.einsum('xyij,xyj->xyi', G_null, eigenVec2)
 
                     norm = np.sqrt(np.sum(np.abs(senseMaps)**2, axis=2))
                     norm = np.maximum(norm, eps)
@@ -346,8 +332,8 @@ def nullspace_vectors_G_matrix(kCal, N1, N2, G, patchSize,
                     norm2 = np.maximum(norm2, eps)
                     eigenVec2 = eigenVec2 / norm2[:, :, np.newaxis]
 
-                    aux1 = np.sum(G_null * senseMaps[:, :, np.newaxis, :], axis=3)
-                    aux2 = np.sum(G_null * eigenVec2[:, :, np.newaxis, :], axis=3)
+                    aux1 = np.einsum('xyij,xyj->xyi', G_null, senseMaps)
+                    aux2 = np.einsum('xyij,xyj->xyi', G_null, eigenVec2)
                     final_maps_norm = np.sqrt(np.sum(np.abs(aux1)**2, axis=2))
                     final_maps_norm2 = np.sqrt(np.sum(np.abs(aux2)**2, axis=2))
                     eigen1 = final_maps_norm
@@ -355,30 +341,30 @@ def nullspace_vectors_G_matrix(kCal, N1, N2, G, patchSize,
                     eigenVal = 1.0 - eigen1
 
                     support_mask = (eigenVal < threshold_mask).astype(float)
-                    ratioEig = (eigen2 / (eigen1 + eps)) ** M_auto
+
+                    # === SAFE RATIO (while 循环内) ===
+                    valid = (eigen1 > 1e-12)
+                    ratioEig = np.zeros_like(eigen2)
+                    ratioEig[valid] = np.minimum((eigen2[valid] / eigen1[valid]), 1.0) ** M_auto
                     ratio_small = support_mask * ratioEig
                     ratio_small = (ratio_small > th_ratio).astype(int)
                     flag_convergence_PI = np.sum(ratio_small) > 0
                     M_auto += 1
 
+                if flag_convergence_PI and M_auto >= 100 and verbose == 1:
+                    print('Warning: reached max 100 iterations, forcing stop.')
                 if verbose == 1:
                     print('Most likely Power Iteration has converged for all the voxels within the support. '
                           + str(M_auto) + ' iterations were needed.')
 
-    # At this point, for PI branch we should have either eigenVal (if no convergence-check path)
-    # or eigen1/eigen2 variables (if convergence-check path). For consistency downstream we
-    # will keep eigenVal defined in later FFT branch.
-
-    # ---------- FFT-based interpolation (upsample eigenvalues and map phase) ----------
+    # ==== FFT-based interpolation ====
     if FFT_interpolation == 1:
         N1_cal, N2_cal, _ = kCal.shape
 
-        # build Tukey-like weight (Hann-derived window in MATLAB code formula)
         w1 = 0.54 - 0.46 * np.cos(2.0 * np.pi * np.arange(N1_g) / (N1_g - 1))
         w2 = 0.54 - 0.46 * np.cos(2.0 * np.pi * np.arange(N2_g) / (N2_g - 1))
-        w_sm2d = np.outer(w1, w2)  # shape (N1_g, N2_g)
+        w_sm2d = np.outer(w1, w2)
 
-        # helper to upsample via FFT and apply window (keeps axes explicit)
         def upsample_and_window(mat2d, w2d, outN1, outN2):
             tmp = np.fft.ifftshift(mat2d, axes=(0, 1))
             tmp_k = np.fft.fft2(tmp, axes=(0, 1))
@@ -386,15 +372,12 @@ def nullspace_vectors_G_matrix(kCal, N1, N2, G, patchSize,
             weighted = tmp_k_shifted * w2d
             iffted = np.fft.ifft2(weighted, s=(outN1, outN2), axes=(0, 1))
             out = np.abs(np.fft.fftshift(iffted, axes=(0, 1)))
-            # normalize if nonzero
             mx = out.max()
             if mx > 0:
                 out = out / mx
             return out
 
-        # if we computed eigen1/eigen2 (in convergence path), upsample and check convergence in k-space
         if PowerIteration_G_nullspace_vectors == 1 and (PowerIteration_flag_convergence == 1 or PowerIteration_flag_auto == 1):
-            # eigen1 and eigen2 must exist here (was computed above)
             auxVal = 1.0 - eigen1
             eigenVal = upsample_and_window(auxVal, w_sm2d, N1, N2)
 
@@ -404,7 +387,10 @@ def nullspace_vectors_G_matrix(kCal, N1, N2, G, patchSize,
             eigen1_us = upsample_and_window(eigen1, w_sm2d, N1, N2)
             eigen2_us = upsample_and_window(eigen2, w_sm2d, N1, N2)
 
-            ratioEig = (eigen2_us / (eigen1_us + eps)) ** M
+            # === SAFE RATIO (FFT path 初始检查) ===
+            valid = (eigen1_us > 1e-12)
+            ratioEig = np.zeros_like(eigen2_us)
+            ratioEig[valid] = np.minimum((eigen2_us[valid] / eigen1_us[valid]), 1.0) ** M
             ratio_small = support_mask * ratioEig
             th_ratio = 0.008
             flag_convergence_PI = np.sum(ratio_small > th_ratio) > 0
@@ -422,9 +408,9 @@ def nullspace_vectors_G_matrix(kCal, N1, N2, G, patchSize,
                 if verbose == 1:
                     print('Power Iteration auto-adjusting iterations (FFT path).')
                 M_auto = M + 1
-                while flag_convergence_PI:
-                    senseMaps = np.sum(G_null * senseMaps[:, :, np.newaxis, :], axis=3)
-                    eigenVec2 = np.sum(G_null * eigenVec2[:, :, np.newaxis, :], axis=3)
+                while flag_convergence_PI and M_auto < 100:  # 安全上限
+                    senseMaps = np.einsum('xyij,xyj->xyi', G_null, senseMaps)
+                    eigenVec2 = np.einsum('xyij,xyj->xyi', G_null, eigenVec2)
 
                     norm = np.sqrt(np.sum(np.abs(senseMaps)**2, axis=2))
                     norm = np.maximum(norm, eps)
@@ -437,8 +423,8 @@ def nullspace_vectors_G_matrix(kCal, N1, N2, G, patchSize,
                     norm2 = np.maximum(norm2, eps)
                     eigenVec2 = eigenVec2 / norm2[:, :, np.newaxis]
 
-                    aux1 = np.sum(G_null * senseMaps[:, :, np.newaxis, :], axis=3)
-                    aux2 = np.sum(G_null * eigenVec2[:, :, np.newaxis, :], axis=3)
+                    aux1 = np.einsum('xyij,xyj->xyi', G_null, senseMaps)
+                    aux2 = np.einsum('xyij,xyj->xyi', G_null, eigenVec2)
                     final_maps_norm = np.sqrt(np.sum(np.abs(aux1)**2, axis=2))
                     final_maps_norm2 = np.sqrt(np.sum(np.abs(aux2)**2, axis=2))
                     eigen1 = final_maps_norm
@@ -451,25 +437,23 @@ def nullspace_vectors_G_matrix(kCal, N1, N2, G, patchSize,
                     eigen1_us = upsample_and_window(eigen1, w_sm2d, N1, N2)
                     eigen2_us = upsample_and_window(eigen2, w_sm2d, N1, N2)
 
-                    ratioEig = (eigen2_us / (eigen1_us + eps)) ** M_auto
+                    # === SAFE RATIO (FFT path while 循环内) ===
+                    valid = (eigen1_us > 1e-12)
+                    ratioEig = np.zeros_like(eigen2_us)
+                    ratioEig[valid] = np.minimum((eigen2_us[valid] / eigen1_us[valid]), 1.0) ** M_auto
                     ratio_small = support_mask * ratioEig
                     flag_convergence_PI = np.sum(ratio_small > th_ratio) > 0
                     M_auto += 1
 
+                if flag_convergence_PI and M_auto >= 100 and verbose == 1:
+                    print('Warning: reached max 100 iterations, forcing stop.')
                 if verbose == 1:
                     print('Most likely Power Iteration has converged for all the voxels within the support. '
                           + str(M_auto) + ' iterations were needed.')
 
-        # other cases: if PI done but no convergence checking (both flags zero),
-        # or if SVD branch earlier produced eigenVal (3D), upsample accordingly.
         elif PowerIteration_G_nullspace_vectors == 1 and PowerIteration_flag_convergence == 0 and PowerIteration_flag_auto == 0:
-            # eigenVal currently is 2D = 1 - final_maps_norm (from earlier branch)
             eigenVal = upsample_and_window(eigenVal, w_sm2d, N1, N2)
         elif PowerIteration_G_nullspace_vectors == 0:
-            # eigenVal from SVD branch was 3D; reduce to something upsample-able.
-            # Sum across channels or take smallest? MATLAB took abs(ifft2(fft2(ifftshift(eigenVal)).*w_sm))
-            # Here we collapse by taking last singular value channel if present:
-            # but more faithful: sum over channels before upsample
             eig2d = np.sum(eigenVal, axis=2) if 'eigenVal' in locals() and eigenVal.ndim == 3 else eigenVal
             eigenVal = upsample_and_window(eig2d, w_sm2d, N1, N2)
 
@@ -479,7 +463,6 @@ def nullspace_vectors_G_matrix(kCal, N1, N2, G, patchSize,
             w_gauss1 = windows.gausswin(N1_g, gauss_win_param)
             w_gauss2 = windows.gausswin(N2_g, gauss_win_param)
         except Exception:
-            # fallback: approximate gaussian using sigma derived from gauss_win_param
             sigma1 = (N1_g - 1) / (2.0 * gauss_win_param)
             sigma2 = (N2_g - 1) / (2.0 * gauss_win_param)
             x1 = np.arange(N1_g) - (N1_g - 1) / 2.0
@@ -487,37 +470,39 @@ def nullspace_vectors_G_matrix(kCal, N1, N2, G, patchSize,
             w_gauss1 = np.exp(-0.5 * (x1 / (sigma1 + eps))**2)
             w_gauss2 = np.exp(-0.5 * (x2 / (sigma2 + eps))**2)
 
-        apodizing_window = np.outer(w_gauss1, w_gauss2)  # shape (N1_g, N2_g)
+        apodizing_window = np.outer(w_gauss1, w_gauss2)
 
-        # ---- build low-res image grid and place kCal centered ----
         imLowRes_cal = np.zeros((N1_g, N2_g, Nc), dtype=np.complex128)
-        start1 = (N1_g - N1_cal) // 2
-        start2 = (N2_g - N2_cal) // 2
+        N1_cal, N2_cal, _ = kCal.shape
+        
+       
+        center_low1 = N1_g // 2
+        center_low2 = N2_g // 2
+        half_cal1   = N1_cal // 2
+        half_cal2   = N2_cal // 2
+        start1      = center_low1 - half_cal1
+        start2      = center_low2 - half_cal2
         imLowRes_cal[start1:start1 + N1_cal, start2:start2 + N2_cal, :] = kCal
 
-        # apply apodizing window and transform to image domain (MATLAB: fftshift(ifft2(ifftshift(...))))
         tmp = imLowRes_cal * apodizing_window[:, :, np.newaxis]
         tmp_ifft = np.fft.ifft2(np.fft.ifftshift(tmp, axes=(0, 1)), axes=(0, 1))
         imLowRes_cal = np.fft.fftshift(tmp_ifft, axes=(0, 1))
 
-        # compute cim and correct phase of senseMaps
         num = np.sum(np.conj(senseMaps) * imLowRes_cal, axis=2)
         den = np.sum(np.abs(senseMaps)**2, axis=2)
         den = np.maximum(den, eps)
         cim = num / den
         senseMaps = senseMaps * np.exp(1j * np.angle(cim))[:, :, np.newaxis]
 
-        # upsample senseMaps from (N1_g,N2_g) to (N1,N2) using same windowing in k-space
         tmp = np.fft.ifftshift(senseMaps, axes=(0, 1))
         tmp_k = np.fft.fft2(tmp, axes=(0, 1))
         tmp_k_shifted = np.fft.fftshift(tmp_k, axes=(0, 1))
-        weighted = tmp_k_shifted * w_sm2d[:, :, np.newaxis]  # broadcast to channels
-        iffted = np.fft.ifft2(weighted, s=(N1, N2), axes=(0, 1))
+        weighted = tmp_k_shifted * w_sm2d[:, :, np.newaxis]
+        iffted = np.fft.ifft2(weighted, s=(N1, N2), axes=(0, 1))   # 直接用 weighted
         senseMaps = np.fft.fftshift(iffted, axes=(0, 1))
 
-    # ensure eigenVal exists for return (if not set, set a default small/zeros)
+    # ensure eigenVal exists
     if 'eigenVal' not in locals():
-        # fallback: build a neutral eigenVal of appropriate size
         eigenVal = np.zeros((N1_g, N2_g))
     return senseMaps, eigenVal
 
@@ -679,29 +664,35 @@ if __name__ == "__main__":
     # 修改1：对kData进行IFFT，需要指定axes参数，只对空间维度(0,1)做变换，保持线圈维度
     imData = np.abs(np.fft.fftshift(np.fft.ifft2(np.fft.ifftshift(kData, axes=(0,1)), axes=(0,1)), axes=(0,1)))
     # 修改2：使用mdisp函数将3D数据(256,256,32)拼接成2D图像
-    plt.imshow(mdisp(imData), cmap='gray')
+    plt.figure()
+    imData = np.abs(np.fft.fftshift(np.fft.ifft2(np.fft.ifftshift(kData, axes=(0,1)), axes=(0,1)), axes=(0,1)))
+    plt.imshow(mdisp(imData), cmap='gray', interpolation='nearest', vmin=0, vmax=1e-8)  # ← 关键一行
     plt.axis('image')
     plt.axis('off')
     plt.title('Data in the spatial domain')
     plt.clim(0, 1e-8)
-    plt.savefig('fig1_spatial.png', dpi=150, bbox_inches='tight')
+    plt.savefig('fig1_spatial.png', dpi=300, bbox_inches='tight')  # 建议把 dpi 提高到 300
     plt.show()
     
     # Selection of calibration data
     cal_length = 32
-    center_x = int(np.ceil(N1 / 2)) + even_pisco(N1)
-    center_y = int(np.ceil(N2 / 2)) + even_pisco(N2)
-    cal_index_x = np.arange(center_x - int(np.floor(cal_length / 2)), center_x + int(np.floor(cal_length / 2)) - even_pisco(cal_length))
-    cal_index_y = np.arange(center_y - int(np.floor(cal_length / 2)), center_y + int(np.floor(cal_length / 2)) - even_pisco(cal_length))
-    kCal = kData[cal_index_x[:, np.newaxis], cal_index_y, :]
+    center_x = int(np.ceil(N1 / 2)) + (1 if even_pisco(N1) else 0)
+    center_y = int(np.ceil(N2 / 2)) + (1 if even_pisco(N2) else 0)
+    half = int(np.floor(cal_length / 2))
+    even_cal = 1 if even_pisco(cal_length) else 0
+
+    # MATLAB 1-based -> Python 0-based
+    cal_index_x = np.arange(center_x - half - 1, center_x + half - even_cal)
+    cal_index_y = np.arange(center_y - half - 1, center_y + half - even_cal)
+    kCal = kData[np.ix_(cal_index_x, cal_index_y, np.arange(Nc))]   # 更安全的 ix_ 写法
     
     # Parameters
     dim_sens = [N1, N2]
     tau = 3
     threshold = 0.08
     M = 10
-    PowerIteration_flag_convergence = None
-    PowerIteration_flag_auto = 1
+    PowerIteration_flag_convergence = 0
+    PowerIteration_flag_auto = 0
     interp_zp = None
     gauss_win_param = None
     kernel_shape = 1
